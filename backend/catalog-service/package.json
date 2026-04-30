@@ -11,9 +11,9 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "amqplib": "^1.0.3",
     "axios": "^1.15.2",
     "express": "^5.2.1",
+    "kafkajs": "^2.2.4",
     "pg": "^8.20.0",
     "swagger-jsdoc": "^6.2.8",
     "swagger-ui-express": "^5.0.1",
