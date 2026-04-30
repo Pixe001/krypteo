@@ -1,14 +1,98 @@
 services:
-  backend:
-    build: ./backend
-    ports:
-      - "3000:3000"
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
     environment:
-      - PORT=3000
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+  postgres-wallet:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: wallet_db
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5433:5432"
+    restart: always
+
+  postgres-catalog:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: catalog_db
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5434:5432"
+    restart: always
+
+  postgres-order:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: order_db
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5435:5432"
+    restart: always
+
+  gateway:
+    build: ./backend/gateway
+    ports:
+      - "3010:3000"
+    depends_on:
+      - order-service
+      - wallet-service
+      - catalog-service
+    restart: always
+
+  order-service:
+    build: ./backend/order-service
+    environment:
+      - DATABASE_URL=postgres://user:password@postgres-order:5432/order_db
+      - KAFKA_BROKERS=kafka:29092
+    depends_on:
+      - kafka
+      - postgres-order
+    restart: always
+
+  wallet-service:
+    build: ./backend/wallet-service
+    environment:
+      - DATABASE_URL=postgres://user:password@postgres-wallet:5432/wallet_db
+      - KAFKA_BROKERS=kafka:29092
+    depends_on:
+      - kafka
+      - postgres-wallet
+    restart: always
+
+  catalog-service:
+    build: ./backend/catalog-service
+    environment:
+      - DATABASE_URL=postgres://user:password@postgres-catalog:5432/catalog_db
+      - KAFKA_BROKERS=kafka:29092
+    depends_on:
+      - kafka
+      - postgres-catalog
+    restart: always
 
   frontend:
     build: ./frontend
     ports:
-      - "80:80"
+      - "5555:80"
     depends_on:
-      - backend
+      - gateway
+    restart: always
