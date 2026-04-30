@@ -2,18 +2,56 @@ const express = require('express');
 const { Pool } = require('pg');
 const amqp = require('amqplib');
 const { v4: uuidv4 } = require('uuid');
+const swaggerUi = require('swagger-ui-express');
+const swaggerJsdoc = require('swagger-jsdoc');
 
 const app = express();
 app.use(express.json());
 const port = 3000;
 
+// Swagger Setup
+const swaggerOptions = {
+  definition: {
+    openapi: '3.0.0',
+    info: { title: 'Order Service API', version: '1.0.0', description: 'Orchestrates the purchase Saga' },
+  },
+  apis: ['./index.js'],
+};
+const specs = swaggerJsdoc(swaggerOptions);
+app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(specs));
+
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
 let channel;
+let amqpConnected = false;
+
+/**
+ * @openapi
+ * /health:
+ *   get:
+ *     summary: Health Check
+ *     responses:
+ *       200:
+ *         description: Service status
+ */
+app.get('/health', async (req, res) => {
+  try {
+    const dbStatus = await pool.query('SELECT 1');
+    res.json({
+      status: 'UP',
+      database: dbStatus ? 'CONNECTED' : 'DOWN',
+      rabbitmq: amqpConnected ? 'CONNECTED' : 'DOWN'
+    });
+  } catch (err) {
+    res.status(500).json({ status: 'DOWN', error: err.message });
+  }
+});
+
 async function connectRabbitMQ() {
   try {
     const connection = await amqp.connect(process.env.RABBITMQ_URL);
     channel = await connection.createChannel();
+    amqpConnected = true;
     await channel.assertQueue('wallet_commands');
     await channel.assertQueue('catalog_commands');
     await channel.assertQueue('saga_events');
@@ -35,7 +73,6 @@ async function connectRabbitMQ() {
           await client.query('UPDATE orders SET status = $1, error_message = $2 WHERE correlation_id = $3', ['FAILED', reason, correlationId]);
         } else if (type === 'STOCK_RESERVED') {
           await client.query('UPDATE orders SET status = $1 WHERE correlation_id = $2', ['STOCK_RESERVED', correlationId]);
-          // Final Step: Commit both
           channel.sendToQueue('wallet_commands', Buffer.from(JSON.stringify({ 
             type: 'COMMIT_TRANSACTION', 
             payload: { userId: payload.userId, amountEur: payload.amountEur, amountBtc: payload.amountBtc }, 
@@ -49,7 +86,6 @@ async function connectRabbitMQ() {
           await client.query('UPDATE orders SET status = $1 WHERE correlation_id = $2', ['COMPLETED', correlationId]);
         } else if (type === 'STOCK_RESERVATION_FAILED') {
           await client.query('UPDATE orders SET status = $1, error_message = $2 WHERE correlation_id = $3', ['COMPENSATING', reason, correlationId]);
-          // Compensation: Release funds
           channel.sendToQueue('wallet_commands', Buffer.from(JSON.stringify({ 
             type: 'COMPENSATE_FUNDS', 
             payload: { userId: payload.userId, amount: payload.amountEur }, 
@@ -65,11 +101,21 @@ async function connectRabbitMQ() {
       channel.ack(msg);
     });
   } catch (err) {
+    amqpConnected = false;
     console.error("RabbitMQ connection error", err);
     setTimeout(connectRabbitMQ, 5000);
   }
 }
 
+/**
+ * @openapi
+ * /orders:
+ *   get:
+ *     summary: Get all orders
+ *     responses:
+ *       200:
+ *         description: List of orders
+ */
 app.get('/orders', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM orders ORDER BY created_at DESC');
@@ -79,6 +125,26 @@ app.get('/orders', async (req, res) => {
   }
 });
 
+/**
+ * @openapi
+ * /orders:
+ *   post:
+ *     summary: Place a new order
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               userId: { type: string }
+ *               symbol: { type: string }
+ *               amountEur: { type: number }
+ *               amountBtc: { type: number }
+ *     responses:
+ *       202:
+ *         description: Order accepted
+ */
 app.post('/orders', async (req, res) => {
   const correlationId = req.headers['x-correlation-id'] || uuidv4();
   const { userId, symbol, amountEur, amountBtc } = req.body;
@@ -90,7 +156,6 @@ app.post('/orders', async (req, res) => {
       [correlationId, userId, symbol, amountEur, amountBtc, 'PENDING']
     );
     
-    // Start Saga
     channel.sendToQueue('wallet_commands', Buffer.from(JSON.stringify({ 
       type: 'RESERVE_FUNDS', 
       payload: { userId, amount: amountEur, symbol, amountBtc }, 
