@@ -23,28 +23,23 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
 let channel;
 let amqpConnected = false;
+let dbConnected = false;
 
 /**
  * @openapi
  * /health:
  *   get:
  *     summary: Health Check
- *     description: Returns the status of the service, database, and message broker.
  *     responses:
  *       200:
  *         description: Service status
  */
 app.get('/health', async (req, res) => {
-  try {
-    const dbStatus = await pool.query('SELECT 1');
-    res.json({
-      status: 'UP',
-      database: dbStatus ? 'CONNECTED' : 'DOWN',
-      rabbitmq: amqpConnected ? 'CONNECTED' : 'DOWN'
-    });
-  } catch (err) {
-    res.status(500).json({ status: 'DOWN', error: err.message });
-  }
+  res.json({
+    status: dbConnected && amqpConnected ? 'UP' : 'PARTIAL_DOWN',
+    database: dbConnected ? 'CONNECTED' : 'DOWN',
+    rabbitmq: amqpConnected ? 'CONNECTED' : 'DOWN'
+  });
 });
 
 async function connectRabbitMQ() {
@@ -52,6 +47,7 @@ async function connectRabbitMQ() {
     const connection = await amqp.connect(process.env.RABBITMQ_URL);
     channel = await connection.createChannel();
     amqpConnected = true;
+    console.log("[WALLET] Connected to RabbitMQ");
     await channel.assertQueue('wallet_commands');
     await channel.assertQueue('saga_events');
     
@@ -112,7 +108,7 @@ async function connectRabbitMQ() {
     });
   } catch (err) {
     amqpConnected = false;
-    console.error("RabbitMQ connection error", err);
+    console.error("[WALLET] RabbitMQ connection error, retrying in 5s...");
     setTimeout(connectRabbitMQ, 5000);
   }
 }
@@ -147,24 +143,32 @@ app.get('/wallets/:userId', async (req, res) => {
 });
 
 async function initDb() {
-  const client = await pool.connect();
   try {
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS wallets (
-        user_id VARCHAR(50) PRIMARY KEY,
-        balance_eur DECIMAL(18, 2) DEFAULT 0,
-        reserved_eur DECIMAL(18, 2) DEFAULT 0,
-        balance_btc DECIMAL(18, 8) DEFAULT 0
-      );
-      INSERT INTO wallets (user_id, balance_eur) VALUES ('user1', 1000.00) ON CONFLICT DO NOTHING;
-    `);
-  } finally {
-    client.release();
+    const client = await pool.connect();
+    try {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS wallets (
+          user_id VARCHAR(50) PRIMARY KEY,
+          balance_eur DECIMAL(18, 2) DEFAULT 0,
+          reserved_eur DECIMAL(18, 2) DEFAULT 0,
+          balance_btc DECIMAL(18, 8) DEFAULT 0
+        );
+        INSERT INTO wallets (user_id, balance_eur) VALUES ('user1', 1000.00) ON CONFLICT DO NOTHING;
+      `);
+      dbConnected = true;
+      console.log("[WALLET] Database initialized");
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    dbConnected = false;
+    console.error("[WALLET] Database connection error, retrying in 5s...");
+    setTimeout(initDb, 5000);
   }
 }
 
-app.listen(port, async () => {
-  await initDb();
-  await connectRabbitMQ();
+app.listen(port, () => {
+  initDb();
+  connectRabbitMQ();
   console.log(`Wallet service listening on port ${port}`);
 });

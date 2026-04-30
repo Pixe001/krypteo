@@ -24,6 +24,7 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
 let channel;
 let amqpConnected = false;
+let dbConnected = false;
 
 /**
  * @openapi
@@ -35,16 +36,11 @@ let amqpConnected = false;
  *         description: Service status
  */
 app.get('/health', async (req, res) => {
-  try {
-    const dbStatus = await pool.query('SELECT 1');
-    res.json({
-      status: 'UP',
-      database: dbStatus ? 'CONNECTED' : 'DOWN',
-      rabbitmq: amqpConnected ? 'CONNECTED' : 'DOWN'
-    });
-  } catch (err) {
-    res.status(500).json({ status: 'DOWN', error: err.message });
-  }
+  res.json({
+    status: dbConnected && amqpConnected ? 'UP' : 'PARTIAL_DOWN',
+    database: dbConnected ? 'CONNECTED' : 'DOWN',
+    rabbitmq: amqpConnected ? 'CONNECTED' : 'DOWN'
+  });
 });
 
 async function connectRabbitMQ() {
@@ -52,6 +48,7 @@ async function connectRabbitMQ() {
     const connection = await amqp.connect(process.env.RABBITMQ_URL);
     channel = await connection.createChannel();
     amqpConnected = true;
+    console.log("[ORDER] Connected to RabbitMQ");
     await channel.assertQueue('wallet_commands');
     await channel.assertQueue('catalog_commands');
     await channel.assertQueue('saga_events');
@@ -60,49 +57,51 @@ async function connectRabbitMQ() {
       const { type, payload, correlationId, reason } = JSON.parse(msg.content.toString());
       console.log(`[ORDER] Received Saga Event: ${type} - CorrelationID: ${correlationId}`);
       
-      const client = await pool.connect();
       try {
-        if (type === 'FUNDS_RESERVED') {
-          await client.query('UPDATE orders SET status = $1 WHERE correlation_id = $2', ['FUNDS_RESERVED', correlationId]);
-          channel.sendToQueue('catalog_commands', Buffer.from(JSON.stringify({ 
-            type: 'RESERVE_STOCK', 
-            payload: { symbol: payload.symbol, amount: payload.amountBtc }, 
-            correlationId 
-          })));
-        } else if (type === 'FUNDS_RESERVATION_FAILED') {
-          await client.query('UPDATE orders SET status = $1, error_message = $2 WHERE correlation_id = $3', ['FAILED', reason, correlationId]);
-        } else if (type === 'STOCK_RESERVED') {
-          await client.query('UPDATE orders SET status = $1 WHERE correlation_id = $2', ['STOCK_RESERVED', correlationId]);
-          channel.sendToQueue('wallet_commands', Buffer.from(JSON.stringify({ 
-            type: 'COMMIT_TRANSACTION', 
-            payload: { userId: payload.userId, amountEur: payload.amountEur, amountBtc: payload.amountBtc }, 
-            correlationId 
-          })));
-          channel.sendToQueue('catalog_commands', Buffer.from(JSON.stringify({ 
-            type: 'COMMIT_STOCK', 
-            payload: { symbol: payload.symbol, amount: payload.amountBtc }, 
-            correlationId 
-          })));
-          await client.query('UPDATE orders SET status = $1 WHERE correlation_id = $2', ['COMPLETED', correlationId]);
-        } else if (type === 'STOCK_RESERVATION_FAILED') {
-          await client.query('UPDATE orders SET status = $1, error_message = $2 WHERE correlation_id = $3', ['COMPENSATING', reason, correlationId]);
-          channel.sendToQueue('wallet_commands', Buffer.from(JSON.stringify({ 
-            type: 'COMPENSATE_FUNDS', 
-            payload: { userId: payload.userId, amount: payload.amountEur }, 
-            correlationId 
-          })));
-          await client.query('UPDATE orders SET status = $1 WHERE correlation_id = $2', ['FAILED', correlationId]);
+        const client = await pool.connect();
+        try {
+          if (type === 'FUNDS_RESERVED') {
+            await client.query('UPDATE orders SET status = $1 WHERE correlation_id = $2', ['FUNDS_RESERVED', correlationId]);
+            channel.sendToQueue('catalog_commands', Buffer.from(JSON.stringify({ 
+              type: 'RESERVE_STOCK', 
+              payload: { symbol: payload.symbol, amount: payload.amountBtc }, 
+              correlationId 
+            })));
+          } else if (type === 'FUNDS_RESERVATION_FAILED') {
+            await client.query('UPDATE orders SET status = $1, error_message = $2 WHERE correlation_id = $3', ['FAILED', reason, correlationId]);
+          } else if (type === 'STOCK_RESERVED') {
+            await client.query('UPDATE orders SET status = $1 WHERE correlation_id = $2', ['STOCK_RESERVED', correlationId]);
+            channel.sendToQueue('wallet_commands', Buffer.from(JSON.stringify({ 
+              type: 'COMMIT_TRANSACTION', 
+              payload: { userId: payload.userId, amountEur: payload.amountEur, amountBtc: payload.amountBtc }, 
+              correlationId 
+            })));
+            channel.sendToQueue('catalog_commands', Buffer.from(JSON.stringify({ 
+              type: 'COMMIT_STOCK', 
+              payload: { symbol: payload.symbol, amount: payload.amountBtc }, 
+              correlationId 
+            })));
+            await client.query('UPDATE orders SET status = $1 WHERE correlation_id = $2', ['COMPLETED', correlationId]);
+          } else if (type === 'STOCK_RESERVATION_FAILED') {
+            await client.query('UPDATE orders SET status = $1, error_message = $2 WHERE correlation_id = $3', ['COMPENSATING', reason, correlationId]);
+            channel.sendToQueue('wallet_commands', Buffer.from(JSON.stringify({ 
+              type: 'COMPENSATE_FUNDS', 
+              payload: { userId: payload.userId, amount: payload.amountEur }, 
+              correlationId 
+            })));
+            await client.query('UPDATE orders SET status = $1 WHERE correlation_id = $2', ['FAILED', correlationId]);
+          }
+        } finally {
+          client.release();
         }
       } catch (err) {
         console.error(err);
-      } finally {
-        client.release();
       }
       channel.ack(msg);
     });
   } catch (err) {
     amqpConnected = false;
-    console.error("RabbitMQ connection error", err);
+    console.error("[ORDER] RabbitMQ connection error, retrying in 5s...");
     setTimeout(connectRabbitMQ, 5000);
   }
 }
@@ -149,49 +148,59 @@ app.post('/orders', async (req, res) => {
   const correlationId = req.headers['x-correlation-id'] || uuidv4();
   const { userId, symbol, amountEur, amountBtc } = req.body;
   
-  const client = await pool.connect();
   try {
-    await client.query(
-      'INSERT INTO orders (correlation_id, user_id, symbol, amount_eur, amount_btc, status) VALUES ($1, $2, $3, $4, $5, $6)',
-      [correlationId, userId, symbol, amountEur, amountBtc, 'PENDING']
-    );
-    
-    channel.sendToQueue('wallet_commands', Buffer.from(JSON.stringify({ 
-      type: 'RESERVE_FUNDS', 
-      payload: { userId, amount: amountEur, symbol, amountBtc }, 
-      correlationId 
-    })));
-    
-    res.status(202).json({ correlationId, status: 'PENDING' });
+    const client = await pool.connect();
+    try {
+      await client.query(
+        'INSERT INTO orders (correlation_id, user_id, symbol, amount_eur, amount_btc, status) VALUES ($1, $2, $3, $4, $5, $6)',
+        [correlationId, userId, symbol, amountEur, amountBtc, 'PENDING']
+      );
+      
+      channel.sendToQueue('wallet_commands', Buffer.from(JSON.stringify({ 
+        type: 'RESERVE_FUNDS', 
+        payload: { userId, amount: amountEur, symbol, amountBtc }, 
+        correlationId 
+      })));
+      
+      res.status(202).json({ correlationId, status: 'PENDING' });
+    } finally {
+      client.release();
+    }
   } catch (err) {
     res.status(500).json({ error: err.message });
-  } finally {
-    client.release();
   }
 });
 
 async function initDb() {
-  const client = await pool.connect();
   try {
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS orders (
-        correlation_id UUID PRIMARY KEY,
-        user_id VARCHAR(50),
-        symbol VARCHAR(10),
-        amount_eur DECIMAL(18, 2),
-        amount_btc DECIMAL(18, 8),
-        status VARCHAR(20),
-        error_message TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-  } finally {
-    client.release();
+    const client = await pool.connect();
+    try {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS orders (
+          correlation_id UUID PRIMARY KEY,
+          user_id VARCHAR(50),
+          symbol VARCHAR(10),
+          amount_eur DECIMAL(18, 2),
+          amount_btc DECIMAL(18, 8),
+          status VARCHAR(20),
+          error_message TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+      dbConnected = true;
+      console.log("[ORDER] Database initialized");
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    dbConnected = false;
+    console.error("[ORDER] Database connection error, retrying in 5s...");
+    setTimeout(initDb, 5000);
   }
 }
 
-app.listen(port, async () => {
-  await initDb();
-  await connectRabbitMQ();
+app.listen(port, () => {
+  initDb();
+  connectRabbitMQ();
   console.log(`Order service listening on port ${port}`);
 });
