@@ -1,6 +1,9 @@
 const express = require('express');
 const { Pool } = require('pg');
 const amqp = require('amqplib');
+const axios = require('axios');
+const WebSocket = require('ws');
+const http = require('http');
 const swaggerUi = require('swagger-ui-express');
 const swaggerJsdoc = require('swagger-jsdoc');
 
@@ -8,11 +11,15 @@ const app = express();
 app.use(express.json());
 const port = 3000;
 
+// Create HTTP server for both Express and WebSockets
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
 // Swagger Setup
 const swaggerOptions = {
   definition: {
     openapi: '3.0.0',
-    info: { title: 'Catalog Service API', version: '1.0.0', description: 'Handles assets inventory and stock reservations' },
+    info: { title: 'Catalog Service API', version: '1.0.0', description: 'Handles assets inventory and real-time prices' },
   },
   apis: ['./index.js'],
 };
@@ -24,22 +31,49 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 let channel;
 let amqpConnected = false;
 let dbConnected = false;
+let currentBtcPrice = 50000;
 
-/**
- * @openapi
- * /health:
- *   get:
- *     summary: Health Check
- *     responses:
- *       200:
- *         description: Service status
- */
+// WebSocket logic: Stream from Binance and broadcast to local clients
+function startBinanceStream() {
+  const binanceWs = new WebSocket('wss://stream.binance.com:9443/ws/btceur@ticker');
+
+  binanceWs.on('message', (data) => {
+    const ticker = JSON.parse(data);
+    currentBtcPrice = parseFloat(ticker.c); // 'c' is the last price
+    
+    // Broadcast to all connected frontend clients
+    const payload = JSON.stringify({ symbol: 'BTC', price: currentBtcPrice, time: Date.now() });
+    wss.clients.forEach(client => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(payload);
+      }
+    });
+  });
+
+  binanceWs.on('error', (err) => {
+    console.error("[CATALOG] Binance WS error:", err.message);
+    setTimeout(startBinanceStream, 5000);
+  });
+
+  binanceWs.on('close', () => {
+    console.log("[CATALOG] Binance WS closed, reconnecting...");
+    setTimeout(startBinanceStream, 5000);
+  });
+}
+
+startBinanceStream();
+
 app.get('/health', async (req, res) => {
   res.json({
     status: dbConnected && amqpConnected ? 'UP' : 'PARTIAL_DOWN',
     database: dbConnected ? 'CONNECTED' : 'DOWN',
-    rabbitmq: amqpConnected ? 'CONNECTED' : 'DOWN'
+    rabbitmq: amqpConnected ? 'CONNECTED' : 'DOWN',
+    btcPrice: currentBtcPrice
   });
+});
+
+app.get('/price/BTC', (req, res) => {
+  res.json({ symbol: 'BTC', priceEur: currentBtcPrice });
 });
 
 async function connectRabbitMQ() {
@@ -53,8 +87,6 @@ async function connectRabbitMQ() {
     
     channel.consume('catalog_commands', async (msg) => {
       const { type, payload, correlationId } = JSON.parse(msg.content.toString());
-      console.log(`[CATALOG] Received ${type} - CorrelationID: ${correlationId}`);
-      
       if (type === 'RESERVE_STOCK') {
         const { symbol, amount } = payload;
         const client = await pool.connect();
@@ -69,35 +101,18 @@ async function connectRabbitMQ() {
             await client.query('ROLLBACK');
             channel.sendToQueue('saga_events', Buffer.from(JSON.stringify({ type: 'STOCK_RESERVATION_FAILED', payload, correlationId, reason: 'Out of stock' })));
           }
-        } catch (err) {
-          await client.query('ROLLBACK');
-          channel.sendToQueue('saga_events', Buffer.from(JSON.stringify({ type: 'STOCK_RESERVATION_FAILED', payload, correlationId, reason: err.message })));
-        } finally {
-          client.release();
-        }
+        } finally { client.release(); }
       } else if (type === 'COMMIT_STOCK') {
         const { symbol, amount } = payload;
-        const client = await pool.connect();
-        try {
-          await client.query('UPDATE inventory SET reserved = reserved - $1 WHERE symbol = $2', [amount, symbol]);
-        } finally {
-          client.release();
-        }
+        await pool.query('UPDATE inventory SET reserved = reserved - $1 WHERE symbol = $2', [amount, symbol]);
       } else if (type === 'COMPENSATE_STOCK') {
         const { symbol, amount } = payload;
-        const client = await pool.connect();
-        try {
-          await client.query('UPDATE inventory SET stock = stock + $1, reserved = reserved - $1 WHERE symbol = $2', [amount, symbol]);
-          console.log(`[CATALOG] Compensated stock for ${symbol} - CorrelationID: ${correlationId}`);
-        } finally {
-          client.release();
-        }
+        await pool.query('UPDATE inventory SET stock = stock + $1, reserved = reserved - $1 WHERE symbol = $2', [amount, symbol]);
       }
       channel.ack(msg);
     });
   } catch (err) {
     amqpConnected = false;
-    console.error("[CATALOG] RabbitMQ connection error, retrying in 5s...");
     setTimeout(connectRabbitMQ, 5000);
   }
 }
@@ -106,29 +121,20 @@ async function initDb() {
   try {
     const client = await pool.connect();
     try {
-      await client.query(`
-        CREATE TABLE IF NOT EXISTS inventory (
-          symbol VARCHAR(10) PRIMARY KEY,
-          stock DECIMAL(18, 8) DEFAULT 0,
-          reserved DECIMAL(18, 8) DEFAULT 0,
-          price_eur DECIMAL(18, 2) DEFAULT 0
-        );
-        INSERT INTO inventory (symbol, stock, price_eur) VALUES ('BTC', 10.0, 50000.00) ON CONFLICT DO NOTHING;
-      `);
+      await client.query(`CREATE TABLE IF NOT EXISTS inventory (symbol VARCHAR(10) PRIMARY KEY, stock DECIMAL(18, 8) DEFAULT 0, reserved DECIMAL(18, 8) DEFAULT 0, price_eur DECIMAL(18, 2) DEFAULT 0);
+        INSERT INTO inventory (symbol, stock, price_eur) VALUES ('BTC', 10.0, 50000.00) ON CONFLICT DO NOTHING;`);
       dbConnected = true;
-      console.log("[CATALOG] Database initialized");
-    } finally {
-      client.release();
-    }
+    } finally { client.release(); }
   } catch (err) {
     dbConnected = false;
-    console.error("[CATALOG] Database connection error, retrying in 5s...");
     setTimeout(initDb, 5000);
   }
 }
 
-app.listen(port, () => {
+app.use((req, res) => res.status(404).json({ error: "Not found in Catalog" }));
+
+server.listen(port, () => {
   initDb();
   connectRabbitMQ();
-  console.log(`Catalog service listening on port ${port}`);
+  console.log(`Catalog service with WebSocket listening on port ${port}`);
 });

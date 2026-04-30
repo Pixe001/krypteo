@@ -12,7 +12,7 @@ const port = 3000;
 const swaggerOptions = {
   definition: {
     openapi: '3.0.0',
-    info: { title: 'Wallet Service API', version: '1.0.0', description: 'Handles user balances and fund reservations' },
+    info: { title: 'Wallet Service API', version: '1.0.0', description: 'Handles user balances' },
   },
   apis: ['./index.js'],
 };
@@ -25,21 +25,31 @@ let channel;
 let amqpConnected = false;
 let dbConnected = false;
 
+app.get('/health', async (req, res) => {
+  res.json({ status: dbConnected && amqpConnected ? 'UP' : 'PARTIAL_DOWN', database: dbConnected, rabbitmq: amqpConnected });
+});
+
 /**
  * @openapi
- * /health:
+ * /{userId}:
  *   get:
- *     summary: Health Check
+ *     summary: Get user wallet
  *     responses:
  *       200:
- *         description: Service status
+ *         description: Wallet info
  */
-app.get('/health', async (req, res) => {
-  res.json({
-    status: dbConnected && amqpConnected ? 'UP' : 'PARTIAL_DOWN',
-    database: dbConnected ? 'CONNECTED' : 'DOWN',
-    rabbitmq: amqpConnected ? 'CONNECTED' : 'DOWN'
-  });
+app.get('/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const result = await pool.query('SELECT balance_eur, balance_btc, reserved_eur FROM wallets WHERE user_id = $1', [userId]);
+    if (result.rows.length > 0) {
+      res.json(result.rows[0]);
+    } else {
+      res.status(404).json({ error: 'Wallet not found' });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 async function connectRabbitMQ() {
@@ -53,8 +63,6 @@ async function connectRabbitMQ() {
     
     channel.consume('wallet_commands', async (msg) => {
       const { type, payload, correlationId } = JSON.parse(msg.content.toString());
-      console.log(`[WALLET] Received ${type} - CorrelationID: ${correlationId}`);
-      
       if (type === 'RESERVE_FUNDS') {
         try {
           const { userId, amount } = payload;
@@ -70,77 +78,24 @@ async function connectRabbitMQ() {
               await client.query('ROLLBACK');
               channel.sendToQueue('saga_events', Buffer.from(JSON.stringify({ type: 'FUNDS_RESERVATION_FAILED', payload, correlationId, reason: 'Insufficient funds' })));
             }
-          } catch (err) {
-            await client.query('ROLLBACK');
-            throw err;
-          } finally {
-            client.release();
-          }
+          } finally { client.release(); }
         } catch (err) {
-          console.error(err);
           channel.sendToQueue('saga_events', Buffer.from(JSON.stringify({ type: 'FUNDS_RESERVATION_FAILED', payload, correlationId, reason: err.message })));
         }
       } else if (type === 'COMMIT_TRANSACTION') {
         const { userId, amountEur, amountBtc } = payload;
-        const client = await pool.connect();
-        try {
-          await client.query('BEGIN');
-          await client.query('UPDATE wallets SET reserved_eur = reserved_eur - $1, balance_btc = balance_btc + $2 WHERE user_id = $3', [amountEur, amountBtc, userId]);
-          await client.query('COMMIT');
-          channel.sendToQueue('saga_events', Buffer.from(JSON.stringify({ type: 'TRANSACTION_COMMITTED', payload, correlationId })));
-        } catch (err) {
-          await client.query('ROLLBACK');
-          console.error(err);
-        } finally {
-          client.release();
-        }
+        await pool.query('UPDATE wallets SET reserved_eur = reserved_eur - $1, balance_btc = balance_btc + $2 WHERE user_id = $3', [amountEur, amountBtc, userId]);
       } else if (type === 'COMPENSATE_FUNDS') {
         const { userId, amount } = payload;
-        const client = await pool.connect();
-        try {
-          await client.query('UPDATE wallets SET balance_eur = balance_eur + $1, reserved_eur = reserved_eur - $1 WHERE user_id = $2', [amount, userId]);
-          console.log(`[WALLET] Compensated funds for ${userId} - CorrelationID: ${correlationId}`);
-        } finally {
-          client.release();
-        }
+        await pool.query('UPDATE wallets SET balance_eur = balance_eur + $1, reserved_eur = reserved_eur - $1 WHERE user_id = $2', [amount, userId]);
       }
       channel.ack(msg);
     });
   } catch (err) {
     amqpConnected = false;
-    console.error("[WALLET] RabbitMQ connection error, retrying in 5s...");
     setTimeout(connectRabbitMQ, 5000);
   }
 }
-
-/**
- * @openapi
- * /wallets/{userId}:
- *   get:
- *     summary: Get user wallet
- *     parameters:
- *       - in: path
- *         name: userId
- *         required: true
- *         schema:
- *           type: string
- *     responses:
- *       200:
- *         description: Wallet information
- */
-app.get('/wallets/:userId', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const result = await pool.query('SELECT balance_eur, balance_btc, reserved_eur FROM wallets WHERE user_id = $1', [userId]);
-    if (result.rows.length > 0) {
-      res.json(result.rows[0]);
-    } else {
-      res.status(404).json({ error: 'Wallet not found' });
-    }
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
 
 async function initDb() {
   try {
@@ -156,16 +111,15 @@ async function initDb() {
         INSERT INTO wallets (user_id, balance_eur) VALUES ('user1', 1000.00) ON CONFLICT DO NOTHING;
       `);
       dbConnected = true;
-      console.log("[WALLET] Database initialized");
-    } finally {
-      client.release();
-    }
+    } finally { client.release(); }
   } catch (err) {
     dbConnected = false;
-    console.error("[WALLET] Database connection error, retrying in 5s...");
     setTimeout(initDb, 5000);
   }
 }
+
+// 404 Handler - MUST BE JSON
+app.use((req, res) => res.status(404).json({ error: `Path ${req.url} not found in Wallet Service` }));
 
 app.listen(port, () => {
   initDb();
