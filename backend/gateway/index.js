@@ -1,9 +1,12 @@
 const express = require('express');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const { v4: uuidv4 } = require('uuid');
+const cors = require('cors');
 
 const app = express();
 const port = 3000;
+
+app.use(cors());
 
 // Middleware for Correlation ID and Logging
 app.use((req, res, next) => {
@@ -17,6 +20,15 @@ app.use((req, res, next) => {
 // Proxy to Order Service
 app.use('/orders', createProxyMiddleware({
   target: 'http://order-service:3000',
+  changeOrigin: true,
+  onProxyReq: (proxyReq, req, res) => {
+    proxyReq.setHeader('x-correlation-id', req.headers['x-correlation-id']);
+  }
+}));
+
+// Proxy to Wallet Service
+app.use('/wallets', createProxyMiddleware({
+  target: 'http://wallet-service:3000',
   changeOrigin: true,
   onProxyReq: (proxyReq, req, res) => {
     proxyReq.setHeader('x-correlation-id', req.headers['x-correlation-id']);

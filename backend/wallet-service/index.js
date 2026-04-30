@@ -77,6 +77,20 @@ async function connectRabbitMQ() {
   }
 }
 
+app.get('/wallets/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const result = await pool.query('SELECT balance_eur, balance_btc, reserved_eur FROM wallets WHERE user_id = $1', [userId]);
+    if (result.rows.length > 0) {
+      res.json(result.rows[0]);
+    } else {
+      res.status(404).json({ error: 'Wallet not found' });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 async function initDb() {
   const client = await pool.connect();
   try {

@@ -70,6 +70,15 @@ async function connectRabbitMQ() {
   }
 }
 
+app.get('/orders', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM orders ORDER BY created_at DESC');
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/orders', async (req, res) => {
   const correlationId = req.headers['x-correlation-id'] || uuidv4();
   const { userId, symbol, amountEur, amountBtc } = req.body;

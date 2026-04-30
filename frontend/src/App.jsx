@@ -1,121 +1,135 @@
-import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from './assets/vite.svg'
-import heroImg from './assets/hero.png'
+import { useState, useEffect } from 'react'
 import './App.css'
 
+const GATEWAY_URL = 'http://localhost:3010'
+const USER_ID = 'user1'
+
 function App() {
-  const [count, setCount] = useState(0)
+  const [wallet, setWallet] = useState({ balance_eur: 0, balance_btc: 0 })
+  const [orders, setOrders] = useState([])
+  const [amountEur, setAmountEur] = useState('')
+  const [loading, setLoading] = useState(false)
+
+  const fetchData = async () => {
+    try {
+      const [walletRes, ordersRes] = await Promise.all([
+        fetch(`${GATEWAY_URL}/wallets/${USER_ID}`),
+        fetch(`${GATEWAY_URL}/orders`)
+      ])
+      const walletData = await walletRes.json()
+      const ordersData = await ordersRes.json()
+      setWallet(walletData)
+      setOrders(ordersData)
+    } catch (err) {
+      console.error('Error fetching data:', err)
+    }
+  }
+
+  useEffect(() => {
+    fetchData()
+    const interval = setInterval(fetchData, 3000)
+    return () => clearInterval(interval)
+  }, [])
+
+  const handleBuy = async (e) => {
+    e.preventDefault()
+    if (!amountEur || loading) return
+
+    setLoading(true)
+    try {
+      const priceBtc = 50000 // Mock price matching Catalog Service
+      const amountBtc = parseFloat(amountEur) / priceBtc
+
+      const response = await fetch(`${GATEWAY_URL}/orders`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: USER_ID,
+          symbol: 'BTC',
+          amountEur: parseFloat(amountEur),
+          amountBtc: amountBtc
+        })
+      })
+
+      if (response.ok) {
+        setAmountEur('')
+        fetchData()
+      }
+    } catch (err) {
+      console.error('Error placing order:', err)
+    } finally {
+      setLoading(false)
+    }
+  }
 
   return (
-    <>
-      <section id="center">
-        <div className="hero">
-          <img src={heroImg} className="base" width="170" height="179" alt="" />
-          <img src={reactLogo} className="framework" alt="React logo" />
-          <img src={viteLogo} className="vite" alt="Vite logo" />
-        </div>
-        <div>
-          <h1>Get started</h1>
-          <p>
-            Edit <code>src/App.jsx</code> and save to test <code>HMR</code>
-          </p>
-        </div>
-        <button
-          type="button"
-          className="counter"
-          onClick={() => setCount((count) => count + 1)}
-        >
-          Count is {count}
-        </button>
-      </section>
+    <div className="container">
+      <header>
+        <h1>Krypteo</h1>
+        <p style={{ color: '#666' }}>Trading de crypto-monnaies fiable et transparent.</p>
+      </header>
 
-      <div className="ticks"></div>
-
-      <section id="next-steps">
-        <div id="docs">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#documentation-icon"></use>
-          </svg>
-          <h2>Documentation</h2>
-          <p>Your questions, answered</p>
-          <ul>
-            <li>
-              <a href="https://vite.dev/" target="_blank">
-                <img className="logo" src={viteLogo} alt="" />
-                Explore Vite
-              </a>
-            </li>
-            <li>
-              <a href="https://react.dev/" target="_blank">
-                <img className="button-icon" src={reactLogo} alt="" />
-                Learn more
-              </a>
-            </li>
-          </ul>
+      <div className="wallet-grid">
+        <div className="card">
+          <div className="balance-item">
+            <h3>Solde EUR</h3>
+            <p>{parseFloat(wallet.balance_eur).toFixed(2)} €</p>
+          </div>
         </div>
-        <div id="social">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#social-icon"></use>
-          </svg>
-          <h2>Connect with us</h2>
-          <p>Join the Vite community</p>
-          <ul>
-            <li>
-              <a href="https://github.com/vitejs/vite" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#github-icon"></use>
-                </svg>
-                GitHub
-              </a>
-            </li>
-            <li>
-              <a href="https://chat.vite.dev/" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#discord-icon"></use>
-                </svg>
-                Discord
-              </a>
-            </li>
-            <li>
-              <a href="https://x.com/vite_js" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#x-icon"></use>
-                </svg>
-                X.com
-              </a>
-            </li>
-            <li>
-              <a href="https://bsky.app/profile/vite.dev" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#bluesky-icon"></use>
-                </svg>
-                Bluesky
-              </a>
-            </li>
-          </ul>
+        <div className="card">
+          <div className="balance-item">
+            <h3>Solde BTC</h3>
+            <p>{parseFloat(wallet.balance_btc).toFixed(8)} BTC</p>
+          </div>
         </div>
-      </section>
+      </div>
 
-      <div className="ticks"></div>
-      <section id="spacer"></section>
-    </>
+      <div className="card">
+        <form onSubmit={handleBuy} className="form-group">
+          <label>Acheter du Bitcoin</label>
+          <input
+            type="number"
+            placeholder="Montant en EUR"
+            value={amountEur}
+            onChange={(e) => setAmountEur(e.target.value)}
+            min="1"
+          />
+          <button type="submit" disabled={loading}>
+            {loading ? 'Traitement...' : 'Placer l\'ordre'}
+          </button>
+        </form>
+      </div>
+
+      <div className="card">
+        <h3>Historique des ordres</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Paire</th>
+              <th>Montant</th>
+              <th>Statut</th>
+              <th>Trace ID</th>
+            </tr>
+          </thead>
+          <tbody>
+            {orders.map((order) => (
+              <tr key={order.correlation_id}>
+                <td>{new Date(order.created_at).toLocaleTimeString()}</td>
+                <td>{order.symbol} / EUR</td>
+                <td>{parseFloat(order.amount_eur).toFixed(2)} €</td>
+                <td>
+                  <span className={`status status-${order.status.toLowerCase()}`}>
+                    {order.status}
+                  </span>
+                </td>
+                <td className="correlation-id">{order.correlation_id}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
   )
 }
 

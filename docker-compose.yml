@@ -35,7 +35,7 @@ services:
   gateway:
     build: ./backend/gateway
     ports:
-      - "3000:3000"
+      - "3010:3000"
     depends_on:
       - order-service
 
@@ -69,6 +69,6 @@ services:
   frontend:
     build: ./frontend
     ports:
-      - "80:80"
+      - "5555:80"
     depends_on:
       - gateway
