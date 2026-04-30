@@ -1,14 +1,74 @@
 services:
-  backend:
-    build: ./backend
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
+  postgres-wallet:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: wallet_db
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5433:5432"
+
+  postgres-catalog:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: catalog_db
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5434:5432"
+
+  postgres-order:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: order_db
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5435:5432"
+
+  gateway:
+    build: ./backend/gateway
     ports:
       - "3000:3000"
+    depends_on:
+      - order-service
+
+  order-service:
+    build: ./backend/order-service
     environment:
-      - PORT=3000
+      - DATABASE_URL=postgres://user:password@postgres-order:5432/order_db
+      - RABBITMQ_URL=amqp://rabbitmq
+    depends_on:
+      - rabbitmq
+      - postgres-order
+
+  wallet-service:
+    build: ./backend/wallet-service
+    environment:
+      - DATABASE_URL=postgres://user:password@postgres-wallet:5432/wallet_db
+      - RABBITMQ_URL=amqp://rabbitmq
+    depends_on:
+      - rabbitmq
+      - postgres-wallet
+
+  catalog-service:
+    build: ./backend/catalog-service
+    environment:
+      - DATABASE_URL=postgres://user:password@postgres-catalog:5432/catalog_db
+      - RABBITMQ_URL=amqp://rabbitmq
+    depends_on:
+      - rabbitmq
+      - postgres-catalog
 
   frontend:
     build: ./frontend
     ports:
       - "80:80"
     depends_on:
-      - backend
+      - gateway
