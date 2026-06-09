@@ -17,6 +17,7 @@ function App() {
   const [message, setMessage] = useState(null)
   
   const ws = useRef(null)
+  const reconnectTimeout = useRef(null)
 
   const fetchData = async () => {
     try {
@@ -35,21 +36,53 @@ function App() {
     fetchData()
     const interval = setInterval(fetchData, 5000)
 
-    // WebSocket for Real-time price
-    ws.current = new WebSocket(WS_URL)
-    ws.current.onmessage = (event) => {
-      const data = JSON.parse(event.data)
-      const newPrice = data.price
-      setBtcPrice(newPrice)
-      setPriceHistory(prev => {
-        const updated = [...prev, { time: new Date().toLocaleTimeString(), price: newPrice }].slice(-60)
-        return updated
-      })
+    // Fonction de connexion WebSocket avec reconnexion automatique
+    const connectWebSocket = () => {
+      console.log(`Tentative de connexion WebSocket vers ${WS_URL}...`)
+      ws.current = new WebSocket(WS_URL)
+
+      ws.current.onmessage = (event) => {
+        try {
+          // Gestion des chaînes vides ou malformées envoyées par MetaMask / extensions
+          if (!event.data || event.data === '[object Object]') return
+
+          const data = JSON.parse(event.data)
+          if (data && data.price) {
+            const newPrice = data.price
+            setBtcPrice(newPrice)
+            setPriceHistory(prev => {
+              const updated = [...prev, { time: new Date().toLocaleTimeString(), price: newPrice }].slice(-60)
+              return updated
+            })
+          }
+        } catch (err) {
+          console.error('Erreur lors du parsing des données WS:', err)
+        }
+      }
+
+      ws.current.onerror = (error) => {
+        console.error('Erreur WebSocket détectée:', error)
+      }
+
+      ws.current.onclose = (e) => {
+        console.log(`WebSocket déconnecté (Code: ${e.code}). Nouvelle tentative dans 3 secondes...`)
+        // Évite d'accumuler plusieurs timeouts de reconnexion
+        if (reconnectTimeout.current) clearTimeout(reconnectTimeout.current)
+        reconnectTimeout.current = setTimeout(() => {
+          connectWebSocket()
+        }, 3000)
+      }
     }
+
+    connectWebSocket()
 
     return () => {
       clearInterval(interval)
-      if (ws.current) ws.current.close()
+      if (reconnectTimeout.current) clearTimeout(reconnectTimeout.current)
+      if (ws.current) {
+        ws.current.onclose = null // Supprime l'écouteur pour éviter la boucle lors du démontage
+        ws.current.close()
+      }
     }
   }, [])
 
@@ -188,11 +221,11 @@ function App() {
                       <td>{new Date(order.created_at).toLocaleTimeString()}</td>
                       <td>{parseFloat(order.amount_eur).toFixed(2)} €</td>
                       <td>
-                        <span className={`status-pill ${order.status.toLowerCase()}`}>
+                        <span className={`status-pill ${order.status ? order.status.toLowerCase() : ''}`}>
                           {order.status}
                         </span>
                       </td>
-                      <td className="trace-cell">{order.correlation_id.substring(0, 8)}...</td>
+                      <td className="trace-cell">{order.correlation_id ? order.correlation_id.substring(0, 8) : ''}...</td>
                     </tr>
                   ))}
                 </tbody>
@@ -205,4 +238,4 @@ function App() {
   )
 }
 
-export default App
+export default App;
